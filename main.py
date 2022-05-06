@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import model
+import cv2
 
 from datasets import trainset_loader
 from datasets import testset_loader
@@ -18,12 +19,12 @@ from torch.autograd import Variable
 from skimage.measure import compare_psnr
 from skimage.measure import compare_ssim
 import time
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 parser = argparse.ArgumentParser()
-parser.add_argument("--epochs", type=int, default=200, help="number of epochs of training")
-parser.add_argument("--batch_size", type=int, default=2, help="size of the batches")
+parser.add_argument("--epochs", type=int, default=150, help="number of epochs of training")
+parser.add_argument("--batch_size", type=int, default=1, help="size of the batches")
 parser.add_argument("--lr", type=float, default=1e-4, help="adam: learning rate")
-parser.add_argument("--n_block", type=int, default=3)
+parser.add_argument("--n_block", type=int, default=14)
 parser.add_argument("--n_cpu", type=int, default=4)
 parser.add_argument("--model_save_path", type=str, default="saved_models/1st")
 parser.add_argument('--checkpoint_interval', type=int, default=1)
@@ -34,8 +35,8 @@ cuda = True if torch.cuda.is_available() else False
 
 class net():
     def __init__(self):
-        self.model = model.LDA(opt.n_block, views=1024, dets=512, width=256, height=256, 
-            dImg=0.006641, dDet=0.0072, dAng=0.006134, s2r=2.5, d2r=2.5, binshift=0)
+        self.model = model.LDA(opt.n_block, views=512, dets=512, width=256, height=256, 
+            dImg=0.006641, dDet=0.0072, dAng=0.006134 * 2, s2r=2.5, d2r=2.5, binshift=0)
         self.loss = nn.MSELoss()
         self.path = opt.model_save_path
         self.train_data = DataLoader(trainset_loader("mayo_data_low_dose_256", '64views'),
@@ -132,6 +133,8 @@ class net():
         j = 0
         for batch_index, data in enumerate(self.test_data):
             input_data, label_data, prj_data, res_name = data
+            
+            #print(data)
             if cuda:
                 input_data = input_data.cuda()
                 label_data = label_data.cuda()
@@ -159,7 +162,8 @@ class net():
                 
                 # print("avepsnr: %f, ssim: %f" % (np.mean(psnr), np.mean(ssim)))
                 # print("psnr: %f, ssim: %f" % (psnr[i], ssim[i]))
-                # sio.savemat(res_name[i], {'data':res[i,0], 'psnr':psnr[i], 'ssim':ssim[i]})
+                #sio.savemat(res_name[i], {'data':res[i,0], 'psnr':psnr[i], 'ssim':ssim[i]})
+                cv2.imwrite(res_name[i][:-4] + ".png", res[i,0] * 255)
         print("avepsnr_input: %f, avessim_input: %f" % (np.mean(Psnr_input), np.mean(Ssim_input)))
         print("avepsnr: %f, avessim: %f" % (np.mean(Psnr), np.mean(Ssim)))
 
@@ -171,5 +175,5 @@ class net():
 
 if __name__ == "__main__":
     network = net()
-    network.train()
+    #network.train()
     network.test()

@@ -30,15 +30,15 @@ class prj_fun(Function):
         temp = ctlib.projection(input_data, options, 0) - proj
         intervening_res = ctlib.backprojection(temp, options, 0)
         self.save_for_backward(intervening_res, weight, options)
-        out = input_data - weight * intervening_res
+        out = input_data - weight * intervening_res                        # y = x - weight * A^T (Ax - b)
         return out
 
     @staticmethod
     def backward(self, grad_output):
         intervening_res, weight, options = self.saved_tensors
         temp = ctlib.projection(grad_output, options, 0)
-        temp = ctlib.backprojection(temp, options, 0)
-        grad_input = grad_output - weight * temp
+        temp = ctlib.backprojection(temp, options, 0)                   #A^TA dy
+        grad_input = grad_output - weight * temp                      # dy - A^TA dy
         temp = intervening_res * grad_output
         grad_weight = - temp.sum().view(-1)
         return grad_input, grad_weight, None, None
@@ -47,21 +47,30 @@ class prj_fun(Function):
 class projection(Function):
     @staticmethod
     def forward(self, input_data, options):
-        temp = ctlib.projection(input_data, options, 0)
-        intervening_res = ctlib.backprojection(temp, options, 0)
-        self.save_for_backward(intervening_res, weight, options)
-        out = input_data - weight * intervening_res
+           # y = Ax   x = A^T y
+        out = ctlib.projection(input_data, options, 0)
+        self.save_for_backward(options, input_data)
         return out
 
     @staticmethod
     def backward(self, grad_output):
-        intervening_res, weight, options = self.saved_tensors
-        temp = ctlib.projection(grad_output, options, 0)
-        temp = ctlib.backprojection(temp, options, 0)
-        grad_input = grad_output - weight * temp
-        temp = intervening_res * grad_output
-        grad_weight = - temp.sum().view(-1)
-        return grad_input, grad_weight, None, None
+        options, input_data = self.saved_tensors
+        grad_input = ctlib.backprojection(grad_output, options, 0)
+        return grad_input, None
+    
+class back_projection(Function):
+    @staticmethod
+    def forward(self, input_data, options):
+        #self.save_for_backward(options)   # y = Ax   x = A^T y
+        out = ctlib.backprojection(input_data, options, 0)
+        self.save_for_backward(options, input_data)
+        return out
+
+    @staticmethod
+    def backward(self, grad_output):
+        options, input_data = self.saved_tensors
+        grad_input = ctlib.projection(grad_output, options, 0)
+        return grad_input, None
 
 class sigma_activation(nn.Module):
     def __init__(self, ddelta):
@@ -101,7 +110,9 @@ class LDA(nn.Module):
         binshift = kwargs['binshift']
         options = torch.Tensor([views, dets, width, height, dImg, dDet, dAng, s2r, d2r, binshift])
         
-        ratio = 1024 / 64
+        self.views = views
+        
+        ratio = self.views / 64
         options_spase_view = torch.Tensor([views/ratio, dets, width, height, dImg, dDet, dAng * ratio, s2r, d2r, binshift])
         
         self.options = nn.Parameter(options, requires_grad=False)
@@ -124,12 +135,12 @@ class LDA(nn.Module):
         self.deconv2 = nn.ConvTranspose2d(channel_num, channel_num, kernel_size=3, padding=1)
         self.deconv3 = nn.ConvTranspose2d(channel_num, channel_num, kernel_size=3, padding=1)
         
-        self.conv0_s = nn.Conv2d(1, channel_num, kernel_size=3, padding=1)
+        self.conv0_s = nn.Conv2d(4, channel_num, kernel_size=3, padding=1)
         self.conv1_s = nn.Conv2d(channel_num, channel_num, kernel_size=3, padding=1)
         self.conv2_s = nn.Conv2d(channel_num, channel_num, kernel_size=3, padding=1)
         self.conv3_s = nn.Conv2d(channel_num, channel_num, kernel_size=3, padding=1)
         
-        self.deconv0_s = nn.ConvTranspose2d(channel_num, 1, kernel_size=3, padding=1)
+        self.deconv0_s = nn.ConvTranspose2d(channel_num, 4, kernel_size=3, padding=1)
         self.deconv1_s = nn.ConvTranspose2d(channel_num, channel_num, kernel_size=3, padding=1)
         self.deconv2_s = nn.ConvTranspose2d(channel_num, channel_num, kernel_size=3, padding=1)
         self.deconv3_s = nn.ConvTranspose2d(channel_num, channel_num, kernel_size=3, padding=1)
@@ -143,7 +154,15 @@ class LDA(nn.Module):
         
         self.adj_weight = adj_weight()
         
+        self.projection = projection()
+        self.back_projection = back_projection()
+        
+        
         self.c = 10**5
+        
+        self.kernel_size_folding = 5
+        self.stride_folding = 2
+        self.padding_folding = 2
         
         self.alpha_list = []
         for block_index in range(block_num):
@@ -157,6 +176,13 @@ class LDA(nn.Module):
             eval_func1 = "self.beta_" + str(block_index) + " = nn.Parameter(torch.Tensor([0.02]), requires_grad=True)"
             exec(eval_func1)
             eval_func2 = "self.beta_list.append(" + "self.beta_" + str(block_index) + ")"
+            exec(eval_func2)
+            
+        self.theta_list = []
+        for block_index in range(block_num):
+            eval_func1 = "self.theta_" + str(block_index) + " = nn.Parameter(torch.Tensor([0.02]), requires_grad=True)"
+            exec(eval_func1)
+            eval_func2 = "self.theta_list.append(" + "self.theta_" + str(block_index) + ")"
             exec(eval_func2)
         
         
@@ -204,9 +230,11 @@ class LDA(nn.Module):
         [x1, x2, x3, x4] = x_x4_forward
         
         # graph Laplacian
-        x5 = nn.functional.unfold(x4, 8, dilation=1, padding=0, stride=8)
+        x5 = nn.functional.unfold(x4, self.kernel_size_folding, dilation=1, padding=self.padding_folding, stride=self.stride_folding)
+        
         x6 = self.block1(x5, adj)
-        x6 = nn.functional.fold(x6, (1024, 512), 8, dilation=1, padding=0, stride=8)  # 1024 * 512 * channel   # 256 * 256
+        x6 = nn.functional.fold(x6, (self.views // self.stride_folding, 512 // self.stride_folding), self.kernel_size_folding, dilation=1, padding=self.padding_folding, stride=self.stride_folding)  # 1024 * 512 * channel   # 256 * 256
+        
         
         x4_dec = self.deconv3_s(x6)
         x3_deri_act = self.deri_act(x3)
@@ -216,7 +244,11 @@ class LDA(nn.Module):
         x1_deri_act = self.deri_act(x1)
         x1_dec = self.deconv0_s(torch.mul(x1_deri_act, x2_dec))
         
-        x1_dec = ctlib.backprojection(x1_dec, self.options, 0)
+        x1_dec = x1_dec.view(-1, 4, self.views // 2 * 512 // 2)
+        
+        x1_dec = nn.functional.fold(x1_dec, (self.views, 512), 2, dilation=1, padding=0, stride=2)
+        
+        x1_dec = self.back_projection.apply(x1_dec, self.options)
         
         return x1_dec
     
@@ -228,15 +260,18 @@ class LDA(nn.Module):
         
         return norm_out
     
-    def x4_forward(self, x):
+    def x4_forward(self, x):                                           # 256 * 256
         x1 = self.conv0(x)
         x2 = self.conv1(self.act(x1))
         x3 = self.conv2(self.act(x2))
         x4 = self.conv3(self.act(x3))
         return [x1, x2, x3, x4]
 
-    def x4_forward_sinogram(self, x):
-        x = ctlib.projection(x, self.options, 0)
+    def x4_forward_sinogram(self, x):                                 # 1024 * 512    -> 512 * 256 * 4
+        x = self.projection.apply(x, self.options)
+        x = nn.functional.unfold(x, 2, dilation=1, padding=0, stride=2)     # 
+        x = x.view(-1, 4, self.views // 2, 512 // 2)
+        
         x1 = self.conv0_s(x)
         x2 = self.conv1_s(self.act(x1))
         x3 = self.conv2_s(self.act(x2))
@@ -245,7 +280,7 @@ class LDA(nn.Module):
         
     def function_value(self, x, proj, x_x4_forward):
         
-        ff_ = torch.norm(ctlib.projection(x, self.options, 0) - proj, p = 2, dim=[1, 2, 3], keepdim=False)
+        ff_ = torch.norm(self.projection.apply(x, self.options_spase_view) - proj, p = 2, dim=[1, 2, 3], keepdim=False)
         f_ = 0.5 * ff_ * ff_ + self.submodule_R(x_x4_forward)
         return torch.mean(f_, dim=0, keepdim=False)
         
@@ -258,7 +293,7 @@ class LDA(nn.Module):
         
         
         # graph Laplacian
-        patch1 = nn.functional.unfold(x4, 8, dilation=1, padding=0, stride=8)
+        patch1 = nn.functional.unfold(x4, self.kernel_size_folding, dilation=1, padding=self.padding_folding, stride=self.stride_folding)
         
         
         
@@ -276,6 +311,7 @@ class LDA(nn.Module):
             # get the step size
             alpha = torch.abs(self.alpha_list[i])     
             beta = torch.abs(self.beta_list[i])
+            theta = torch.abs(self.theta_list[i])
             
             #print(alpha)
             
@@ -293,7 +329,7 @@ class LDA(nn.Module):
             
             # compute the candidate x_u and x_v
             input_second_regu = self.x4_forward_sinogram(b)
-            x = b - beta * self.submodule_grad_R(lambda_, self.x4_forward(b)) - beta * self.submodule_grad_sinogram(input_second_regu, adj1)# change submodule_grad_R_exact to submodule_grad_R if using inexact tranpose
+            x = b - beta * self.submodule_grad_R(lambda_, self.x4_forward(b)) - theta * self.submodule_grad_sinogram(input_second_regu, adj1)# change submodule_grad_R_exact to submodule_grad_R if using inexact tranpose
             
             
         return x
